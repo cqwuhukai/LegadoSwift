@@ -206,16 +206,6 @@ LegadoSwift/
 
 详见 [CONTRIBUTING.md](CONTRIBUTING.md)
 
-## 📋 待办事项
-
-- [ ] 支持更多电子书格式（PDF、MOBI 等）
-- [ ] 自定义字体导入
-- [ ] 阅读主题切换
-- [ ] 全文搜索功能
-- [ ] 阅读统计
-- [ ] iCloud 同步
-- [ ] 导出功能优化
-- [ ] 插件系统
 
 ## 🙏 致谢
 
