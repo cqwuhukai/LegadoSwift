@@ -190,7 +190,9 @@ public class BookManager {
             isLoading = false
             loadingMessage = nil
             currentContent = "获取目录失败: \(error.localizedDescription)"
-            print("[WebBook] ❌ TOC error: \(error)")
+            #if DEBUG
+            print("[WebBook] TOC error: \(error)")
+            #endif
         }
     }
 
@@ -237,7 +239,9 @@ public class BookManager {
             prefetchChapters(from: index + 1, count: 10, book: book, source: src)
         } catch {
             currentContent = "加载失败: \(error.localizedDescription)\n\n请检查网络连接或更换书源重试。"
-            print("[WebBook] ❌ Content error: \(error)")
+            #if DEBUG
+            print("[WebBook] Content error: \(error)")
+            #endif
         }
 
         isLoading = false
@@ -252,7 +256,9 @@ public class BookManager {
         guard startIndex < endIndex else { return }
 
         let chaptersToFetch = Array(chapters[startIndex..<endIndex])
-        print("[WebBook] 🔄 Prefetching chapters \(startIndex)..\(endIndex - 1)")
+        #if DEBUG
+        print("[WebBook] Prefetching chapters \(startIndex)..\(endIndex - 1)")
+        #endif
 
         Task.detached(priority: .background) {
             for chapter in chaptersToFetch {
@@ -267,10 +273,14 @@ public class BookManager {
                     _ = try await WebBookEngine.shared.fetchChapterContent(
                         book: book, chapter: chapter, source: source
                     )
-                    print("[WebBook] 📦 Prefetched: \(chapter.title)")
+                    #if DEBUG
+                    print("[WebBook] Prefetched: \(chapter.title)")
+                    #endif
                 } catch {
                     // Silent failure for prefetch — don't interrupt reading
-                    print("[WebBook] ⚠️ Prefetch failed for \(chapter.title): \(error.localizedDescription)")
+                    #if DEBUG
+                    print("[WebBook] Prefetch failed: \(chapter.title)")
+                    #endif
                 }
 
                 // Small delay between requests to avoid hammering the server

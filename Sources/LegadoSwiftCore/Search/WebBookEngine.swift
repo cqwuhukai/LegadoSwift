@@ -62,20 +62,24 @@ public class WebBookEngine {
                         .replacingOccurrences(of: "{{baseUrl}}", with: bookUrl.hasSuffix("/") ? bookUrl : bookUrl + "/")
                         .replacingOccurrences(of: "{{URL}}", with: bookUrl)
                     // Resolve relative URL
-                    tocUrl = resolveUrl(tocUrl, baseUrl: bookUrl)
+                    tocUrl = URLResolver.resolve(tocUrl, baseUrl: bookUrl)
                 } else {
                     // It's a rule — evaluate it against the book info page
                     tocUrl = infoRule.getString(tocUrlTemplate) ?? bookUrl
-                    tocUrl = resolveUrl(tocUrl, baseUrl: bookUrl)
+                    tocUrl = URLResolver.resolve(tocUrl, baseUrl: bookUrl)
                 }
             } else {
                 tocUrl = bookUrl
             }
         }
         
-        print("[WebBook] 📚 Fetching TOC: \(tocUrl)")
+        #if DEBUG
+        print("[WebBook] Fetching TOC: \(tocUrl)")
+        #endif
         let html = try await NetworkClient.fetchString(url: tocUrl, headers: headers)
-        print("[WebBook] 📄 TOC response: \(html.count) chars")
+        #if DEBUG
+        print("[WebBook] TOC response: \(html.count) chars")
+        #endif
 
         // Parse chapter list rule
         var listRule = tocRule.chapterList ?? ""
@@ -92,53 +96,93 @@ public class WebBookEngine {
             throw LegadoError.parseError("目录列表规则为空")
         }
 
-        let context = AnalyzeContext(book: book, source: source)
-        let analyzeRule = AnalyzeRule(content: html, context: context)
+        // === Replicate Android BookChapterList.analyzeChapterList ===
+        let nextUrlList = [tocUrl]  // Track visited URLs
+        
+        // Parse first page: returns (chapters, nextUrls)
+        let firstResult = analyzeChapterListPage(
+            book: book, source: source,
+            baseUrl: tocUrl, redirectUrl: tocUrl,
+            body: html, tocRule: tocRule, listRule: listRule,
+            getNextUrl: true
+        )
+        var chapters = firstResult.chapters
 
-        // Pre-split rules for chapter name/url
-        let ruleChapterName = analyzeRule.splitSourceRule(tocRule.chapterName ?? "")
-        let ruleChapterUrl = analyzeRule.splitSourceRule(tocRule.chapterUrl ?? "")
+        // Handle nextTocUrl pagination
+        switch firstResult.nextUrls.count {
+        case 0:
+            // No pagination — single page TOC
+            break
 
-        // Get chapter elements
-        let elements = analyzeRule.getElements(listRule)
-        print("[WebBook] 📊 Found \(elements.count) chapter elements")
+        case 1:
+            // Sequential pagination (like Android's single-nextUrl branch)
+            var visitedUrls = Set<String>(nextUrlList)
+            var nextUrl = firstResult.nextUrls[0]
 
-        if elements.isEmpty {
-            // Log a snippet of the HTML for debugging
-            print("[WebBook] ⚠️ HTML snippet: \(String(html.prefix(500)))")
+            while !nextUrl.isEmpty && !visitedUrls.contains(nextUrl) {
+                visitedUrls.insert(nextUrl)
+                print("[WebBook] Fetching TOC page: \(nextUrl) (page \(visitedUrls.count))")
+
+                do {
+                    let nextHtml = try await NetworkClient.fetchString(url: nextUrl, headers: headers)
+                    let pageResult = analyzeChapterListPage(
+                        book: book, source: source,
+                        baseUrl: nextUrl, redirectUrl: nextUrl,
+                        body: nextHtml, tocRule: tocRule, listRule: listRule,
+                        getNextUrl: true
+                    )
+                    chapters.append(contentsOf: pageResult.chapters)
+                    nextUrl = pageResult.nextUrls.first ?? ""
+                } catch {
+                    print("[WebBook] ⚠️ Failed to fetch TOC page \(nextUrl): \(error.localizedDescription)")
+                    break
+                }
+            }
+            #if DEBUG
+            print("[WebBook] TOC pagination: \(visitedUrls.count) pages total")
+            #endif
+
+        default:
+            // Multiple next URLs → concurrent fetch (like Android's multi-nextUrl branch)
+            print("[WebBook] Concurrent TOC fetch: \(firstResult.nextUrls.count) additional pages")
+            try await withThrowingTaskGroup(of: [BookChapter].self) { group in
+                for pageUrl in firstResult.nextUrls {
+                    group.addTask {
+                        let pageHtml = try await NetworkClient.fetchString(url: pageUrl, headers: headers)
+                        return self.analyzeChapterListPage(
+                            book: book, source: source,
+                            baseUrl: pageUrl, redirectUrl: pageUrl,
+                            body: pageHtml, tocRule: tocRule, listRule: listRule,
+                            getNextUrl: false
+                        ).chapters
+                    }
+                }
+                for try await pageChapters in group {
+                    chapters.append(contentsOf: pageChapters)
+                }
+            }
+        }
+
+        if chapters.isEmpty {
+            print("[WebBook] HTML snippet: \(String(html.prefix(300)))")
             throw LegadoError.parseError("未找到章节列表")
         }
 
-        // Parse each element using setContent on shared analyzeRule
-        var chapters: [BookChapter] = []
-        for (index, element) in elements.enumerated() {
-            analyzeRule.setContent(element)
-
-            // Extract chapter name
-            guard let title = analyzeRule.getString(ruleChapterName),
-                  !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                continue
-            }
-
-            // Extract chapter URL
-            let rawUrl = analyzeRule.getString(ruleChapterUrl) ?? ""
-            let chapterUrl = resolveUrl(rawUrl, baseUrl: tocUrl)
-
-            let chapter = BookChapter(
-                bookId: book.id,
-                index: index,
-                title: title.trimmingCharacters(in: .whitespacesAndNewlines),
-                chapterUrl: chapterUrl.isEmpty ? tocUrl : chapterUrl
-            )
-            chapters.append(chapter)
-        }
-
-        // Handle reverse
+        // Reverse handling (Android: if !reverse, reverse; then reverse again if !getReverseToc)
+        // Simplified: the chapters are collected in page order
         if reverse {
             chapters.reverse()
         }
 
-        // Re-index
+        // Deduplicate by chapterUrl (like Android's LinkedHashSet)
+        var seenUrls = Set<String>()
+        chapters = chapters.filter { ch in
+            let url = ch.chapterUrl ?? ""
+            if url.isEmpty { return true }
+            return seenUrls.insert(url).inserted
+        }
+
+        // Re-index all chapters
         for i in chapters.indices {
             chapters[i] = BookChapter(
                 bookId: chapters[i].bookId,
@@ -148,12 +192,84 @@ public class WebBookEngine {
             )
         }
 
-        print("[WebBook] ✅ Parsed \(chapters.count) chapters")
+        #if DEBUG
+        print("[WebBook] Parsed \(chapters.count) chapters total")
+        #endif
 
         // Cache the TOC
         saveTocCache(bookId: book.id, chapters: chapters)
 
         return chapters
+    }
+
+    /// Analyze a single TOC page — replicates Android's inner analyzeChapterList function.
+    /// Returns chapters found on this page + list of next page URLs.
+    private func analyzeChapterListPage(
+        book: Book,
+        source: BookSource,
+        baseUrl: String,
+        redirectUrl: String,
+        body: String,
+        tocRule: TocRule,
+        listRule: String,
+        getNextUrl: Bool
+    ) -> (chapters: [BookChapter], nextUrls: [String]) {
+        let context = AnalyzeContext(book: book, source: source)
+        let analyzeRule = AnalyzeRule(content: body, context: context)
+        analyzeRule.setBaseUrl(baseUrl)
+        analyzeRule.setRedirectUrl(redirectUrl)
+
+        // Get chapter elements
+        let elements = analyzeRule.getElements(listRule)
+        #if DEBUG
+        print("[WebBook] Found \(elements.count) chapter elements")
+        #endif
+
+        // Get next page URLs (BEFORE iterating elements — critical for correct behavior)
+        var nextUrls: [String] = []
+        if getNextUrl {
+            let nextTocRule = tocRule.nextTocUrl
+            if let nextTocRule = nextTocRule, !nextTocRule.isEmpty {
+                // Use isUrl: true to resolve relative URLs to absolute!
+                if let urls = analyzeRule.getStringList(nextTocRule, isUrl: true) {
+                    for item in urls {
+                        if item != redirectUrl && !item.isEmpty {
+                            nextUrls.append(item)
+                        }
+                    }
+                }
+                #if DEBUG
+                print("[WebBook] nextTocUrls: \(nextUrls)")
+                #endif
+            }
+        }
+
+        // Parse chapter elements
+        let ruleChapterName = analyzeRule.splitSourceRule(tocRule.chapterName ?? "")
+        let ruleChapterUrl = analyzeRule.splitSourceRule(tocRule.chapterUrl ?? "")
+
+        var chapters: [BookChapter] = []
+        for (index, element) in elements.enumerated() {
+            analyzeRule.setContent(element)
+
+            guard let title = analyzeRule.getString(ruleChapterName),
+                  !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                continue
+            }
+
+            // Use isUrl: true to resolve chapter URLs
+            let chapterUrl = analyzeRule.getString(ruleChapterUrl, isUrl: true) ?? baseUrl
+
+            let chapter = BookChapter(
+                bookId: book.id,
+                index: index,
+                title: title.trimmingCharacters(in: .whitespacesAndNewlines),
+                chapterUrl: chapterUrl.isEmpty ? baseUrl : chapterUrl
+            )
+            chapters.append(chapter)
+        }
+
+        return (chapters, nextUrls)
     }
 
     // MARK: - Fetch Chapter Content
@@ -167,7 +283,9 @@ public class WebBookEngine {
     ) async throws -> String {
         // Check cache first
         if let cached = loadCachedContent(bookId: book.id, chapterIndex: chapter.index) {
-            print("[WebBook] 📖 Using cached content for chapter \(chapter.index): \(chapter.title)")
+            #if DEBUG
+            print("[WebBook] Using cached content for chapter \(chapter.index)")
+            #endif
             return cached
         }
 
@@ -185,11 +303,15 @@ public class WebBookEngine {
             throw LegadoError.parseError("章节URL为空")
         }
 
-        print("[WebBook] 📖 Fetching content: \(chapterUrl)")
+        #if DEBUG
+        print("[WebBook] Fetching content: \(chapterUrl)")
+        #endif
 
         let headers = NetworkClient.parseHeaders(from: source.header)
         let html = try await NetworkClient.fetchString(url: chapterUrl, headers: headers)
-        print("[WebBook] 📄 Content response: \(html.count) chars")
+        #if DEBUG
+        print("[WebBook] Content response: \(html.count) chars")
+        #endif
 
         let context = AnalyzeContext(book: book, source: source)
         let analyzeRule = AnalyzeRule(content: html, context: context)
@@ -229,7 +351,9 @@ public class WebBookEngine {
             .filter { !$0.isEmpty }
         cleanContent = lines.joined(separator: "\n")
 
-        print("[WebBook] ✅ Content parsed: \(cleanContent.count) chars")
+        #if DEBUG
+        print("[WebBook] Content parsed: \(cleanContent.count) chars")
+        #endif
 
         // Cache the content
         saveCachedContent(bookId: book.id, chapterIndex: chapter.index, content: cleanContent)
@@ -270,22 +394,4 @@ public class WebBookEngine {
 
     // MARK: - URL Resolution
 
-    private func resolveUrl(_ url: String, baseUrl: String) -> String {
-        let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return baseUrl }
-        if trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://") { return trimmed }
-        if trimmed.hasPrefix("//") { return "https:" + trimmed }
-        if trimmed.hasPrefix("/") {
-            if let base = URL(string: baseUrl), let scheme = base.scheme, let host = base.host {
-                return "\(scheme)://\(host)\(trimmed)"
-            }
-            return baseUrl + trimmed
-        }
-        // Relative URL — resolve against base
-        if let base = URL(string: baseUrl) {
-            let baseDir = base.deletingLastPathComponent()
-            return baseDir.appendingPathComponent(trimmed).absoluteString
-        }
-        return baseUrl + "/" + trimmed
-    }
 }

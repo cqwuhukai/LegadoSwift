@@ -16,11 +16,10 @@ enum EpubReader {
         let fileURL = URL(fileURLWithPath: filePath)
         
         guard FileManager.default.fileExists(atPath: filePath) else {
-            print("[EPUB] ❌ File not found: \(filePath)")
             return result
         }
         
-        print("[EPUB] 📖 Opening EPUB: \(filePath)")
+
 
         let tempDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("legado_epub_\(bookId)")
@@ -30,14 +29,12 @@ enum EpubReader {
 
         // Unzip EPUB
         guard unzipEpub(at: fileURL, to: tempDir) else {
-            print("[EPUB] ❌ Unzip failed for: \(filePath)")
             return result
         }
 
         // Parse container.xml to find OPF path
         let containerPath = tempDir.appendingPathComponent("META-INF/container.xml")
         guard FileManager.default.fileExists(atPath: containerPath.path) else {
-            print("[EPUB] ❌ META-INF/container.xml not found")
             if let opfPath = findOPFFile(in: tempDir) {
                 return parseOPF(opfRelPath: opfPath, tempDir: tempDir, bookId: bookId)
             }
@@ -45,12 +42,10 @@ enum EpubReader {
         }
         
         guard let containerXML = readFileContent(at: containerPath) else {
-            print("[EPUB] ❌ Cannot read container.xml")
             return result
         }
         
         guard let opfRelPath = extractAttribute(from: containerXML, tag: "rootfile", attribute: "full-path") else {
-            print("[EPUB] ❌ No rootfile in container.xml")
             return result
         }
         
@@ -62,13 +57,12 @@ enum EpubReader {
     private static func parseOPF(opfRelPath: String, tempDir: URL, bookId: String) -> EpubParseResult {
         var result = EpubParseResult()
         
-        print("[EPUB] 📖 OPF: \(opfRelPath)")
+
         
         let opfURL = tempDir.appendingPathComponent(opfRelPath)
         let opfDir = opfURL.deletingLastPathComponent()
         
         guard let opfXML = readFileContent(at: opfURL) else {
-            print("[EPUB] ❌ Cannot read OPF: \(opfURL.path)")
             return result
         }
         
@@ -82,13 +76,13 @@ enum EpubReader {
         result.author = extractContent(from: cleanedOPF, tag: "dc:creator")
             ?? extractContent(from: cleanedOPF, tag: "creator") ?? ""
         
-        print("[EPUB] 📚 Title: \(result.title), Author: \(result.author)")
+
 
         // Extract spine and manifest from cleaned OPF
         let spineIds = extractSpineItems(from: cleanedOPF)
         let manifest = extractManifestItems(from: cleanedOPF)
         
-        print("[EPUB] 📋 Spine: \(spineIds.count) items, Manifest: \(manifest.count) items")
+
 
         // Build chapters from spine
         for (idx, spineId) in spineIds.enumerated() {
@@ -111,17 +105,15 @@ enum EpubReader {
         
         // Fallback: NCX
         if result.chapters.isEmpty {
-            print("[EPUB] ⚠️ Spine produced 0 chapters, trying NCX")
             result.chapters = parseChaptersFromNCX(opfXML: cleanedOPF, opfDir: opfDir, bookId: bookId)
         }
         
         // Fallback: all HTML files
         if result.chapters.isEmpty {
-            print("[EPUB] ⚠️ NCX failed, using all HTML files")
             result.chapters = parseChaptersFromManifest(manifest: manifest, opfDir: opfDir, bookId: bookId)
         }
 
-        print("[EPUB] ✅ Parsed \(result.chapters.count) chapters")
+
         return result
     }
     
@@ -130,27 +122,15 @@ enum EpubReader {
     /// Converts `<opf:item ...>` to `<item ...>`, `<opf:manifest>` to `<manifest>`, etc.
     /// This makes regex-based parsing work regardless of namespace usage.
     private static func stripNamespacePrefixes(_ xml: String) -> String {
-        var result = xml
         // Remove namespace prefixes from tags: <opf:tag → <tag, </opf:tag → </tag
-        if let regex = try? NSRegularExpression(pattern: #"<(/?)(\w+):"#) {
-            result = regex.stringByReplacingMatches(
-                in: result,
-                range: NSRange(result.startIndex..., in: result),
-                withTemplate: "<$1$2_ns_"
-            )
-        }
-        // Now convert the ns-tagged form back to clean tags
-        // <item_ns_ → <item, <manifest_ns_ → <manifest  
-        // Actually simpler: just remove all namespace prefixes directly
-        result = xml
         if let regex = try? NSRegularExpression(pattern: #"<(/?)[\w]+:"#) {
-            result = regex.stringByReplacingMatches(
-                in: result,
-                range: NSRange(result.startIndex..., in: result),
+            return regex.stringByReplacingMatches(
+                in: xml,
+                range: NSRange(xml.startIndex..., in: xml),
                 withTemplate: "<$1"
             )
         }
-        return result
+        return xml
     }
     
     // MARK: - Find OPF
@@ -294,7 +274,6 @@ enum EpubReader {
         // Method 1: /usr/bin/unzip (most reliable for EPUB)
         if runProcess("/usr/bin/unzip", args: ["-o", "-q", source.path, "-d", destination.path]) {
             if verifyExtraction(destination) {
-                print("[EPUB] ✅ Unzipped with unzip")
                 return true
             }
         }
@@ -304,12 +283,10 @@ enum EpubReader {
         try? FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         if runProcess("/usr/bin/ditto", args: ["-xk", source.path, destination.path]) {
             if verifyExtraction(destination) {
-                print("[EPUB] ✅ Unzipped with ditto")
                 return true
             }
         }
         
-        print("[EPUB] ❌ All unzip methods failed")
         return false
     }
     
@@ -318,22 +295,13 @@ enum EpubReader {
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = args
         process.standardOutput = FileHandle.nullDevice
-        
-        // Capture stderr for debugging
-        let errPipe = Pipe()
-        process.standardError = errPipe
+        process.standardError = FileHandle.nullDevice
         
         do {
             try process.run()
             process.waitUntilExit()
-            if process.terminationStatus != 0 {
-                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-                let errStr = String(data: errData, encoding: .utf8) ?? ""
-                print("[EPUB] ⚠️ \(path) failed (status \(process.terminationStatus)): \(errStr.prefix(200))")
-            }
             return process.terminationStatus == 0
         } catch {
-            print("[EPUB] ⚠️ \(path) error: \(error)")
             return false
         }
     }

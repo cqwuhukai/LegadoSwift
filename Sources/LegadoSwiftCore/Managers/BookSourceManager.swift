@@ -44,11 +44,51 @@ public class BookSourceManager {
         let decoder = JSONDecoder()
         var newSources: [BookSource] = []
 
+        // Try decoding as array first
         if let arr = try? decoder.decode([BookSource].self, from: data) {
             newSources = arr
         } else if let single = try? decoder.decode(BookSource.self, from: data) {
             newSources = [single]
         } else {
+            // Fallback: try to parse as JSON array and decode each element individually
+            // This prevents one malformed source from crashing the entire import
+            if let jsonArray = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+                var successCount = 0
+                var failCount = 0
+                for item in jsonArray {
+                    do {
+                        let itemData = try JSONSerialization.data(withJSONObject: item)
+                        let source = try decoder.decode(BookSource.self, from: itemData)
+                        newSources.append(source)
+                        successCount += 1
+                    } catch {
+                        failCount += 1
+                        let name = item["bookSourceName"] as? String ?? "unknown"
+                        print("[Import] ⚠️ Failed to decode source '\(name)': \(error.localizedDescription)")
+                    }
+                }
+                if newSources.isEmpty {
+                    throw LegadoError.decodeFailed
+                }
+                print("[Import] 📖 Decoded \(successCount) sources, \(failCount) failed")
+            } else if let jsonObj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                // Single object that failed standard decoding — try re-serializing
+                do {
+                    let itemData = try JSONSerialization.data(withJSONObject: jsonObj)
+                    let source = try decoder.decode(BookSource.self, from: itemData)
+                    newSources = [source]
+                } catch {
+                    throw LegadoError.decodeFailed
+                }
+            } else {
+                throw LegadoError.decodeFailed
+            }
+        }
+
+        // Filter out sources with empty bookSourceUrl (invalid data)
+        newSources = newSources.filter { !$0.bookSourceUrl.isEmpty }
+
+        guard !newSources.isEmpty else {
             throw LegadoError.decodeFailed
         }
 

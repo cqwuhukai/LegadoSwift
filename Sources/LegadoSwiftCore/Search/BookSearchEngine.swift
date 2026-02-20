@@ -62,7 +62,9 @@ class BookSearchEngine {
                     self.searchProgress = "已找到 \(self.results.count) 本书..."
 
                     if !sourceResults.isEmpty {
-                        print("[Search] ✅ \(sourceName): 找到 \(sourceResults.count) 本书")
+                        #if DEBUG
+                        print("[Search] \(sourceName): found \(sourceResults.count) books")
+                        #endif
                     }
                 }
             }
@@ -70,6 +72,13 @@ class BookSearchEngine {
 
         await MainActor.run {
             isSearching = false
+            // Sort results by relevance to keyword
+            let kw = keyword.lowercased()
+            results.sort { a, b in
+                let aScore = relevanceScore(name: a.name, author: a.author, keyword: kw)
+                let bScore = relevanceScore(name: b.name, author: b.author, keyword: kw)
+                return aScore > bScore
+            }
             if results.isEmpty {
                 if searchErrors.isEmpty {
                     searchProgress = "未找到结果"
@@ -80,6 +89,17 @@ class BookSearchEngine {
                 searchProgress = "共 \(results.count) 本书"
             }
         }
+    }
+
+    /// Calculate relevance score for sorting search results
+    private func relevanceScore(name: String, author: String, keyword: String) -> Int {
+        let lowerName = name.lowercased()
+        let lowerAuthor = author.lowercased()
+        if lowerName == keyword { return 100 }  // Exact match
+        if lowerName.hasPrefix(keyword) { return 80 }  // Starts with
+        if lowerName.contains(keyword) { return 60 }  // Name contains
+        if lowerAuthor.contains(keyword) { return 40 }  // Author contains
+        return 0
     }
 
     // MARK: - Search in Single Source
@@ -95,14 +115,18 @@ class BookSearchEngine {
             page: 1
         )
         guard !searchUrl.isEmpty, let _ = URL(string: searchUrl) else {
-            print("[Search] ❌ \(source.bookSourceName): 无效URL: \(searchUrl)")
+            #if DEBUG
+            print("[Search] \(source.bookSourceName): invalid URL: \(searchUrl)")
+            #endif
             throw LegadoError.invalidURL
         }
 
-        print("[Search] 🔍 \(source.bookSourceName): \(searchUrl)")
+        #if DEBUG
+        print("[Search] \(source.bookSourceName): \(searchUrl)")
         if let body = postBody {
-            print("[Search] 📝 POST body: \(body)")
+            print("[Search] POST body: \(body)")
         }
+        #endif
 
         let headers = NetworkClient.parseHeaders(from: source.header)
 
@@ -115,10 +139,21 @@ class BookSearchEngine {
             html = try await NetworkClient.fetchString(url: searchUrl, headers: headers)
         }
 
-        print("[Search] 📄 \(source.bookSourceName): 收到 \(html.count) 字符")
+        #if DEBUG
+        print("[Search] \(source.bookSourceName): received \(html.count) chars")
+        #endif
 
         // Parse results based on search rules
-        let books = parseSearchResults(html: html, source: source, baseUrl: searchUrl)
+        var books = parseSearchResults(html: html, source: source, baseUrl: searchUrl)
+
+        // Filter by keyword relevance (replicating Android's filter callback)
+        // Books must have name or author containing the keyword
+        let lowercaseKeyword = keyword.lowercased()
+        books = books.filter { book in
+            book.name.lowercased().contains(lowercaseKeyword) ||
+            book.author.lowercased().contains(lowercaseKeyword)
+        }
+
         return books
     }
 
@@ -196,7 +231,7 @@ class BookSearchEngine {
         // Resolve relative URL
         urlPart = urlPart.trimmingCharacters(in: .whitespacesAndNewlines)
         if !urlPart.hasPrefix("http") {
-            urlPart = resolveUrl(urlPart, baseUrl: baseUrl)
+            urlPart = URLResolver.resolve(urlPart, baseUrl: baseUrl)
         }
 
         return (urlPart, postBody)
@@ -211,7 +246,6 @@ class BookSearchEngine {
     /// 3. Properly resolves URLs using search URL as base
     private func parseSearchResults(html: String, source: BookSource, baseUrl: String) -> [SearchBook] {
         guard let rules = source.ruleSearch else {
-            print("[Search] ⚠️ \(source.bookSourceName): 没有搜索规则")
             return []
         }
 
@@ -220,7 +254,6 @@ class BookSearchEngine {
 
         // Get book list elements using bookList rule
         guard let bookListRule = rules.bookList, !bookListRule.isEmpty else {
-            print("[Search] ⚠️ \(source.bookSourceName): 没有bookList规则")
             return []
         }
 
@@ -236,7 +269,9 @@ class BookSearchEngine {
         }
 
         let elements = analyzeRule.getElements(listRule)
-        print("[Search] 📊 \(source.bookSourceName): 规则引擎找到 \(elements.count) 个元素")
+        #if DEBUG
+        print("[Search] \(source.bookSourceName): found \(elements.count) elements")
+        #endif
 
         if elements.isEmpty { return [] }
 
@@ -268,7 +303,7 @@ class BookSearchEngine {
             if rawBookUrl.isEmpty {
                 fullBookUrl = baseUrl
             } else {
-                fullBookUrl = resolveUrl(rawBookUrl, baseUrl: baseUrl)
+                fullBookUrl = URLResolver.resolve(rawBookUrl, baseUrl: baseUrl)
             }
 
             // Extract author
@@ -281,7 +316,7 @@ class BookSearchEngine {
             if rawCoverUrl.isEmpty {
                 fullCoverUrl = nil
             } else {
-                fullCoverUrl = resolveUrl(rawCoverUrl, baseUrl: baseUrl)
+                fullCoverUrl = URLResolver.resolve(rawCoverUrl, baseUrl: baseUrl)
             }
 
             // Extract kind (may be a list)
@@ -327,7 +362,9 @@ class BookSearchEngine {
         var seen = Set<String>()
         books = books.filter { seen.insert($0.bookUrl).inserted }
 
-        print("[Search] ✅ \(source.bookSourceName): 解析得到 \(books.count) 本书")
+        #if DEBUG
+        print("[Search] Parsed \(books.count) books from \(source.bookSourceName)")
+        #endif
         return books
     }
 
@@ -344,32 +381,6 @@ class BookSearchEngine {
         }
         return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
-
-    // MARK: - URL Resolution
-
-    /// Resolve a relative URL to absolute (replicating Android NetworkUtils.getAbsoluteURL)
-    private func resolveUrl(_ url: String, baseUrl: String) -> String {
-        let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return baseUrl }
-        if trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://") { return trimmed }
-        if trimmed.hasPrefix("//") { return "https:" + trimmed }
-        if trimmed.hasPrefix("/") {
-            // Absolute path — combine with base domain
-            if let base = URL(string: baseUrl), let scheme = base.scheme, let host = base.host {
-                let port = base.port.map { ":\($0)" } ?? ""
-                return "\(scheme)://\(host)\(port)\(trimmed)"
-            }
-            return baseUrl + trimmed
-        }
-        // Relative path — resolve against base
-        if let base = URL(string: baseUrl) {
-            let baseDir = base.deletingLastPathComponent()
-            return baseDir.appendingPathComponent(trimmed).absoluteString
-        }
-        return baseUrl + "/" + trimmed
-    }
-
-    // MARK: - Cancel
 
     func cancel() {
         isSearching = false

@@ -90,8 +90,13 @@ public class AnalyzeRule {
     private var analyzeByJSONPath: AnalyzeByJSONPath?
     private var jsEngine: JSEngine?
 
+    /// Base URL for relative URL resolution (original request URL)
+    private var baseUrl: String?
+    /// Redirect URL for URL resolution (final URL after redirects)
+    private var redirectUrl: URL?
+
     // JS pattern: <js>...</js> or @js:...
-    private static let jsPatternStr = #"<js>([\s\S]*?)</js>|@js:([\s\S]*?)$"#
+    private static let jsPatternStr = #"<js>([\s\S]*?)</js>|@js:([\s\S]*)$"#
 
     // put pattern: @put:\{...}
     private static let putPatternStr = #"@put:\{([^}]+)\}"#
@@ -118,11 +123,49 @@ public class AnalyzeRule {
     }
 
     /// Set/replace the content to analyze
-    public func setContent(_ content: Any, baseUrl: String? = nil) {
+    @discardableResult
+    public func setContent(_ content: Any, baseUrl: String? = nil) -> AnalyzeRule {
         self.content = content
         self.analyzeByCSS = nil
         self.analyzeByJSONPath = nil
+        if let baseUrl = baseUrl {
+            self.baseUrl = baseUrl
+        }
         detectContentType()
+        return self
+    }
+
+    /// Set the base URL for relative URL resolution
+    @discardableResult
+    public func setBaseUrl(_ baseUrl: String?) -> AnalyzeRule {
+        if let baseUrl = baseUrl {
+            self.baseUrl = baseUrl
+        }
+        return self
+    }
+
+    /// Set the redirect URL (final URL after redirects) for URL resolution
+    @discardableResult
+    public func setRedirectUrl(_ url: String) -> AnalyzeRule {
+        self.redirectUrl = URL(string: url)
+        return self
+    }
+
+    /// Resolve a relative URL to an absolute URL using redirectUrl or baseUrl
+    private func resolveAbsoluteURL(_ urlStr: String) -> String {
+        let trimmed = urlStr.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return baseUrl ?? "" }
+        // Already absolute
+        if trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://") {
+            return trimmed
+        }
+        // Resolve against redirectUrl first, then baseUrl
+        if let base = redirectUrl ?? URL(string: baseUrl ?? "") {
+            if let resolved = URL(string: trimmed, relativeTo: base) {
+                return resolved.absoluteString
+            }
+        }
+        return trimmed
     }
 
     // MARK: - Analyzer Accessors
@@ -204,14 +247,14 @@ public class AnalyzeRule {
     }
 
     /// Get single string from rule
-    public func getString(_ ruleStr: String?) -> String? {
+    public func getString(_ ruleStr: String?, isUrl: Bool = false) -> String? {
         guard let ruleStr = ruleStr, !ruleStr.isEmpty else { return nil }
         let ruleList = splitSourceRuleCached(ruleStr)
-        return getString(ruleList)
+        return getString(ruleList, isUrl: isUrl)
     }
 
     /// Get single string from pre-parsed rule list
-    public func getString(_ ruleList: [SourceRule]) -> String? {
+    public func getString(_ ruleList: [SourceRule], isUrl: Bool = false) -> String? {
         var result: Any = content
 
         for sourceRule in ruleList {
@@ -232,7 +275,11 @@ public class AnalyzeRule {
             case .default:
                 let analyzer = AnalyzeByCSS(content: result)
                 let madeRule = makeUpRule(sourceRule, result: result)
-                resultStr = analyzer.getString(madeRule)
+                if isUrl {
+                    resultStr = analyzer.getString0(madeRule)
+                } else {
+                    resultStr = analyzer.getString(madeRule)
+                }
 
             case .xpath:
                 // XPath not implemented — fall back to CSS
@@ -264,18 +311,24 @@ public class AnalyzeRule {
         }
 
         let finalStr = "\(result)"
-        return finalStr.isEmpty ? nil : finalStr
+        if finalStr.isEmpty { return nil }
+
+        // URL resolution: resolve relative URLs to absolute
+        if isUrl {
+            return resolveAbsoluteURL(finalStr)
+        }
+        return finalStr
     }
 
     /// Get list of strings from rule
-    public func getStringList(_ ruleStr: String?) -> [String]? {
+    public func getStringList(_ ruleStr: String?, isUrl: Bool = false) -> [String]? {
         guard let ruleStr = ruleStr, !ruleStr.isEmpty else { return nil }
 
         let ruleList = splitSourceRuleCached(ruleStr)
-        return getStringList(ruleList)
+        return getStringList(ruleList, isUrl: isUrl)
     }
 
-    public func getStringList(_ ruleList: [SourceRule]) -> [String]? {
+    public func getStringList(_ ruleList: [SourceRule], isUrl: Bool = false) -> [String]? {
         var result: Any = content
         var resultList: [String]? = nil
 
@@ -328,6 +381,23 @@ public class AnalyzeRule {
             if let list = resultList, !list.isEmpty {
                 result = list
             }
+        }
+
+        // If result is a String, split by newlines (matching Android behavior)
+        if resultList == nil, let str = result as? String, !str.isEmpty {
+            resultList = str.components(separatedBy: "\n").filter { !$0.isEmpty }
+        }
+
+        // URL resolution: resolve all relative URLs to absolute
+        if isUrl, let list = resultList {
+            var urlList: [String] = []
+            for urlStr in list {
+                let absoluteURL = resolveAbsoluteURL(urlStr)
+                if !absoluteURL.isEmpty && !urlList.contains(absoluteURL) {
+                    urlList.append(absoluteURL)
+                }
+            }
+            return urlList.isEmpty ? nil : urlList
         }
 
         return resultList
